@@ -1,0 +1,71 @@
+# yaml-language-server: $schema=https://dv-flow.github.io/flow.dv.schema.json
+fragment:
+  # Unnamed fragment (see src/flow.yaml) -- tasks live under the package, e.g.
+  # fw.proto.uart.fv.
+  tasks:
+  # The kit's synthesizable cores + the protocol checker -- the only RTL the proof
+  # needs. The bundled yosys cannot read SV structs/packages, so the cores + harness
+  # are flattened to plain Verilog by sv2v (with -DFORMAL so the property block is
+  # included) before SymbiYosys reads them.
+  - name: cores
+    uses: std.FileSet
+    with:
+      type: systemVerilogSource
+      base: ${{ rootdir }}/src
+      incdirs:
+      - .
+      include:
+      - uart_tx_xtor_core.sv
+      - uart_rx_xtor_core.sv
+      - uart_proto_checker.sv
+
+  # The back-to-back harness source. Listed as a FileSet so edits to it (and to the
+  # cores) invalidate the sv2v step's cache and force a re-convert.
+  - name: fv-src
+    uses: std.FileSet
+    with:
+      type: systemVerilogSource
+      base: ${{ rootdir }}/tests/formal
+      include:
+      - uart_proto_fv.sv
+
+  # sv2v conversion step: cores + harness -> one yosys-readable .v. Emits a
+  # verilogSource FileSet (via dfm-out) that formal.sby.BMC consumes.
+  - name: sv2v
+    needs: [cores, fv-src]
+    # Always re-convert: a stale conversion silently yields a vacuous/wrong proof.
+    uptodate: false
+    shell: bash
+    run: |
+      set -e
+      OUT="$TASK_RUNDIR/uart_proto_fv.v"
+      # --exclude=Assert is REQUIRED: without it sv2v silently STRIPS every immediate
+      # assert/assume/cover, leaving a vacuous (always-passing) proof. -I src: the
+      # cores `include "uart_xtor_macros.svh".
+      sv2v --exclude=Assert -DFORMAL \
+        -I "${{ rootdir }}/src" \
+        "${{ rootdir }}/src/uart_tx_xtor_core.sv" \
+        "${{ rootdir }}/src/uart_rx_xtor_core.sv" \
+        "${{ rootdir }}/src/uart_proto_checker.sv" \
+        "${{ rootdir }}/tests/formal/uart_proto_fv.sv" > "$OUT"
+      dfm-out fileset --filetype verilogSource --basedir "$TASK_RUNDIR" uart_proto_fv.v
+
+  # SymbiYosys BMC proof. depth 48 lets a character fully traverse the shrunk-rate
+  # serializer -> line -> deframer path (a frame is ~24 cycles at OVERSAMPLE=2,
+  # divisor=1) and be delivered, so the data-integrity tracker fires.
+  - root: fv
+    uses: formal.sby.BMC
+    needs: [sv2v]
+    with:
+      top: uart_proto_fv
+      depth: 48
+
+  # Cover (reachability / non-vacuity): proves every cover() statement (a tracked
+  # character traverses end to end; checker line covers) is reachable -- so the BMC
+  # pass above is not vacuous.
+  - root: fv-cover
+    uses: formal.sby.Cover
+    needs: [sv2v]
+    with:
+      top: uart_proto_fv
+      depth: 48

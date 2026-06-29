@@ -1,0 +1,29 @@
+# yaml-language-server: $schema=https://dv-flow.github.io/flow.dv.schema.json
+fragment:
+  # Unnamed fragment (see src/flow.yaml) -- tasks live under the package, e.g.
+  # fw.proto.uart.uart-proto.
+  tasks:
+  # REQUIRED back-to-back simulation test (design §16): drives the full kit stack
+  # (TX -> serial line -> RX + monitor) and checks round-trip integrity across
+  # framings, parity/framing/break errors, overrun, and monitor observation.
+  - name: uart-proto-tb
+    uses: std.FileSet
+    with:
+      type: systemVerilogSource
+      include:
+      - uart_proto_tb.sv
+      incdirs:
+      - .
+
+  - name: uart-proto-img
+    uses: hdlsim.vlt.SimImage
+    needs: [files, uart-proto-tb]
+    with:
+      top: [uart_proto_tb]
+      # exercise the protocol checker's concurrent-SVA layer in sim too
+      defines:
+      - UART_PROTO_SVA
+
+  - root: uart-proto
+    uses: hdlsim.vlt.SimRun
+    needs: [uart-proto-img]

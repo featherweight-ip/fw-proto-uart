@@ -1,0 +1,70 @@
+# yaml-language-server: $schema=https://dv-flow.github.io/flow.dv.schema.json
+fragment:
+  # No fragment name: its tasks live directly under the package (fw.proto.uart.files).
+  tasks:
+  # The protocol kit itself: the class-layer package + the transactor SV
+  # interfaces/modules (which cannot live in a package). incdir '.' picks up the
+  # .svh includes (API classes, bridges, struct macros).
+  - export: files
+    uses: std.FileSet
+    with:
+      type: systemVerilogSource
+      include:
+      - fw_proto_uart_pkg.sv
+      - uart_proto_checker.sv
+      - uart_tx_xtor_if.sv
+      - uart_tx_xtor_core.sv
+      - uart_tx_xtor.sv
+      - uart_rx_xtor_if.sv
+      - uart_rx_xtor_core.sv
+      - uart_rx_xtor.sv
+      - uart_monitor_xtor_if.sv
+      - uart_monitor_xtor_core.sv
+      - uart_monitor_xtor.sv
+      incdirs:
+      - .
+
+  # ----------------------------------------------------------------------
+  # Protocol checker, exported on its own. uart_proto_checker is a self-contained
+  # passive module (bare line + cfg ports, no package/class-layer dependency), so
+  # methodology-independent consumers (a sim bind, real RTL, a formal harness) can
+  # pull in JUST the protocol invariants without the full kit.
+  # ----------------------------------------------------------------------
+  - export: checker
+    uses: std.FileSet
+    with:
+      type: systemVerilogSource
+      include:
+      - uart_proto_checker.sv
+      incdirs:
+      - .
+
+  # ----------------------------------------------------------------------
+  # Transactor-only exports (no class layer) for methodology-independent consumers.
+  # uart_xtor_macros.svh is picked up via incdir '.'.
+  # ----------------------------------------------------------------------
+  - export: xtor-core
+    uses: std.FileSet
+    with:
+      type: systemVerilogSource
+      include:
+      - uart_tx_xtor_core.sv
+      - uart_rx_xtor_core.sv
+      - uart_monitor_xtor_core.sv
+      incdirs:
+      - .
+
+  - export: xtor-sv
+    uses: std.FileSet
+    needs: [xtor-core]
+    with:
+      type: systemVerilogSource
+      include:
+      - uart_tx_xtor_if.sv
+      - uart_rx_xtor_if.sv
+      - uart_monitor_xtor_if.sv
+      - uart_tx_xtor.sv
+      - uart_rx_xtor.sv
+      - uart_monitor_xtor.sv
+      incdirs:
+      - .
