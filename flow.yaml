@@ -2,11 +2,81 @@
 package:
   name: fw.proto.uart
 
-  # The kit sources live in src/; a runnable back-to-back demonstrator (the REQUIRED
-  # §16 sim test) lives in tests/; a back-to-back formal proof of the cores lives in
-  # tests/formal/. The class layer is self-contained SV (interface-classes + plain
-  # bridges), so the kit imports no external modeling library.
+  # The methodology-neutral DV archetype (dv-flow-libproject): `dfm run
+  # tests`, `smoke`, `lint-rtl`, `tests-info`, `--sim`, `--build`, with this
+  # file filling its slots.
+  uses: project.dv
+
+  # IVPM-generated map: resolves imports by name under packages/. Named
+  # through $IVPM_PACKAGES so the same line works whether this kit is fetched
+  # standalone or vendored under another project's packages/.
+  package-map: "${{ env.IVPM_PACKAGES }}/dv-flow-package-map.yaml"
+
+  imports:
+  - project.dv
+  - hdlsim
+  - hdllint
+  - formal.sby
+
   fragments:
   - src/flow.yaml
   - tests/flow.yaml
   - tests/formal/flow.yaml
+
+  configs:
+  # fw-hdl standard-platform layer: `dfm ... -c use-fw-hdl`, with the
+  # package fetched through the matching IVPM dep-set. There is no SPL layer
+  # yet; add src/spl.yaml as this config's fragment when one is written.
+  - name: use-fw-hdl
+    imports:
+    - fw-hdl
+
+  tasks:
+  # Synthesizable sources: the four cores. The *_xtor_if/*_xtor wrappers
+  # carry the class-side bindings and error injection, and are not
+  # synthesizable.
+  - override: src-rtl
+    needs: [xtor-core]
+
+  # The class (SPL) layer.
+  - override: src-spl
+    needs: [class]
+
+  - override: lint-rtl
+    needs: [lint]
+
+  # Verilator lint over every core and the checker, elaborated from a lint
+  # top (tests/lint). Held to ZERO findings; a waiver needs a reason next to
+  # it in lint-waivers.yaml.
+  - name: lint-top
+    uses: std.FileSet
+    with:
+      type: systemVerilogSource
+      base: tests/lint
+      include: [uart_lint_top.sv]
+
+  - name: lint
+    uses: hdllint.Rtl
+    needs: [src-rtl, checker, lint-top]
+    with:
+      top: [uart_lint_top]
+      waivers: lint-waivers.yaml
+
+  # Formal (tests/formal/flow.yaml). fv-quick is the per-push set; fv and
+  # fv-cover run nightly (ci/run.sh).
+  - root: fv-quick
+    desc: Formal BMC, per-push depth -- tx->rx round trip, tx break, rx break
+    needs: [formal.bmc-quick, formal.bmc-txbrk, formal.bmc-rxbrk]
+  - root: fv
+    desc: Formal BMC -- tx->rx round trip at divisors 1 and 2, tx break, rx break
+    needs: [formal.bmc, formal.bmc-txbrk, formal.bmc-rxbrk]
+  - root: fv-cover
+    desc: Reachability of a round trip, a break character and a clean restart (non-vacuity of fv)
+    needs: [formal.cover, formal.cover-txbrk, formal.cover-rxbrk]
+
+  - override: tests
+    needs: [uart-proto, uart-proto-os4, uart-proto-err]
+
+  # What CI runs on every commit.
+  - override: smoke
+    needs: [uart-proto, uart-proto-os4, uart-proto-err]

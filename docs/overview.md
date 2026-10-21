@@ -1,64 +1,84 @@
 # Overview
 
-`fw-proto-uart` packages the UART **line protocol** as a reusable transactor kit.
-The goal is to let model and test code work in terms of *characters* — "send this
-byte", "give me the next received byte and its status" — while the kit handles the
-entire serial frame: start bit, LSB-first data, parity, stop bits, oversampled
-receive, and the line-error taxonomy.
+`fw-proto-uart` lets model and test code work in characters ("send this
+byte", "here is the next byte received, with its status") while the kit
+handles the frame: start bit, data LSB first, parity, stop bits, the
+oversampled receiver, and the line status.
 
-## Layered architecture
+## Layers
 
 ```
-   method API (interface class)        <- what your code calls
-        |  send() / recv() / observe() / configure()
-   bridge (plain class)                <- adapts API <-> transactor task API
+   API (interface class)          what your code calls
+        |  send / recv / observe / configure / set_break / send_err
+   bridge (plain class)           API <-> transactor tasks
         |  blocking tasks
-   transactor interface (SV interface) <- synthesizable FIFOs + held config
-        |  ready/valid character stream + cfg_* level
-   transactor core (SV module)         <- the clocked serializer / deserializer
-        |  serial line (txd / rxd)
-   the UART wire
+   transactor interface (SV)      FIFO, held configuration, error injection
+        |  ready/valid + cfg_* levels + brk
+   cores (SV modules)             baud tick, tx, rx, monitor: synthesizable
+        |  txd / rxd
+   the line
 ```
 
-Every role is built from the same four files:
+Each role has the kit's six elements:
 
-- **core** (`uart_<role>_xtor_core.sv`) — the clocked FSM. TX serializes a character
-  into a frame; RX/monitor oversample the line and deframe. The core converts between
-  the serial pins and a ready/valid character **stream**, and reads the current
-  framing from a held `cfg_*` level. It contains no SV queues or classes, so it is
-  synthesizable and can be driven through SymbiYosys.
-- **interface** (`uart_<role>_xtor_if.sv`) — hand-coded synthesizable FIFOs plus a
-  blocking individual-argument **task API** (`send`, `recv`, `wait_char`), and the
-  held configuration registers (`configure`) driven to the core.
-- **wrapper** (`uart_<role>_xtor.sv`) — instances the interface and the core and wires
-  them together; exposes `clock`, `reset`, and the bare serial pin.
-- **bridge** (`uart_<role>_xtor_bridge.svh`) — a plain class connecting the task API to
-  the method API. The TX bridge **implements** `uart_tx_if` (a provider). The RX and
-  monitor bridges **hold** a handle to a sink/subscriber and fork a `run()` loop in
-  `start()` (consumers). All bridges implement `uart_config_if`.
+- **API** (`uart_<role>_if.svh`), an `interface class`.
+- **Transactor interface** (`uart_<role>_xtor_if.sv`): a FIFO, the held
+  configuration, and the blocking tasks. Not synthesizable.
+- **Core** (`uart_<role>_xtor_core.sv`): the clocked FSM, between the line
+  and a ready/valid character link. No queues or classes, so it
+  synthesizes and goes through SymbiYosys.
+- **Wrapper** (`uart_<role>_xtor.sv`): the interface, a baud tick core and
+  the role's core, with `clock`, `reset` and the bare pin.
+- **Bridge** (`uart_<role>_bridge.svh`): connects the tasks to the API.
+- The **package** `fw_proto_uart_pkg` holds the APIs and bridges.
 
-## Why two independent streams
+## Shared baud tick (K2)
 
-UART is full-duplex over two physically separate wires; each wire is **simplex**
-(one direction) and the two directions are fully decoupled — there is no response
-travelling back to the transmitter. So the kit gives TX and RX **separate one-way
-APIs** rather than a single request/response transfer. This is the defining shape of
-the protocol and the reason the method layer looks different from a memory-mapped bus.
+`uart_baud_xtor_core` makes the oversampling enable: `tick` is high one
+clock in every `divisor`. The tx, rx and monitor cores count bit time in
+ticks (`OVERSAMPLE`, default 16, per bit) and have no divider of their own.
+The 16550 has one divisor latch for both directions, so a 16550-style
+design instantiates one baud core and gives its tick to tx and rx. That
+saves a second 16-bit counter. Each wrapper holds its own baud core, so the
+transactors also work standalone, as a VIP needs.
 
-## Runtime configuration as a held level
+Every tx bit edge is on a tick, so each bit is exactly `OVERSAMPLE ×
+divisor` clocks. A character is accepted on the tick that ends the previous
+stop bit, so back-to-back frames have no gap.
 
-The framing is runtime-configurable: baud `divisor`, `word_bits` (5–8), parity
-(`none`/`odd`/`even`/`stick`), and stop bits. Rather than a per-character payload,
-configuration is a **held level**: `configure(...)` latches the `cfg_*` registers in
-the transactor interface, which are driven continuously to the core and sampled when
-a frame starts (TX) or a start bit is detected (RX). The character carrier is a fixed
-8-bit maximum; the active `word_bits` selects how many low bits are significant — the
-interface width never changes with configuration.
+## Configuration
 
-## What's fixed vs. parameterized
+The framing is set at run time: `divisor`, `word_bits` (5 to 8), parity
+(none, odd, even, stick), and stop bits. It is a held level into the cores,
+sampled once per character: tx samples it when it accepts the character, rx
+at the start bit. A change therefore applies from the next character (K1).
+The character carrier is always 8 bits, and `word_bits` says how many low
+bits count.
 
-The character width (8), status width (4), and divisor width (16) are fixed. The
-**oversample factor** is a build-time parameter (`OVERSAMPLE`, default 16) so the
-formal harness can shrink it for a tractable bounded-model-check depth — at the real
-16× rate a character crosses in >160 cycles, too deep for end-to-end BMC. The kit's
-formal proof runs at `OVERSAMPLE=2`, `divisor=1`.
+## Break (K4)
+
+The tx core takes `brk` as a level, as 16550 LCR.BC. While `brk` is 1 the
+line is space and no new character is accepted. Characters sent meanwhile
+wait, and go out after the break; a 16550 would send them invisibly and
+lose them. A character already started when `brk` rises carries on
+underneath and is lost, as on a 16550. After `brk` falls, the core holds
+mark for one bit before the next start bit, so a receiver sees the break
+end.
+
+The rx core reports a break (the whole frame space) as one character, data
+0 with BI, then waits for the line to return to mark before it looks for a
+start bit. One break gives one character.
+
+## Error injection (K6)
+
+Error injection is for the VIP only, so it is outside the cores. The tx
+transactor interface builds an injected frame (bad parity, bad stop bit, a
+baud offset in ppm, a glitch at any clock) and drives it clock by clock
+through `ovr_en`/`ovr_val`. The `uart_tx_xtor` wrapper muxes that over the
+core's `txd`. A design that uses the cores carries none of it.
+
+## Fixed and parameterized
+
+The character carrier (8 bits), status (4 bits) and divisor (16 bits) are
+fixed widths. `OVERSAMPLE` is a build-time parameter: the formal harnesses
+run at 2 and 4, so that a frame fits in a tractable BMC depth.

@@ -2,8 +2,8 @@
 // uart_proto_checker -- protocol-invariant checker for the UART line protocol.
 // Passive: every port is an input, so it can be instantiated (or bound) on any UART
 // line tap -- in a formal harness, a sim testbench, or alongside real RTL. It is
-// given the active framing configuration (the same held cfg_* the transactors use)
-// so it can reconstruct the bit period. Protocol invariants belong WITH the
+// given the active divisor (the same held cfg_divisor the transactors use) so it
+// can reconstruct the bit period. Protocol invariants belong WITH the
 // protocol, so this ships in the kit.
 //
 // Two parallel layers checking the same rules (see docs/protocol-property-checking.md
@@ -26,7 +26,6 @@
 // Bit period = OVERSAMPLE * cfg_divisor system clocks (§4.9).
 // ----------------------------------------------------------------------------
 module uart_proto_checker #(
-        parameter int MAX_DATA_BITS      = 8,
         parameter int DIV_WIDTH      = 16,
         parameter int OVERSAMPLE     = 16,
         parameter bit CHECK_STABILITY = 1'b1,  // enable bit-period stability check
@@ -36,16 +35,11 @@ module uart_proto_checker #(
         input  wire                  reset,
         input  wire                  line,         // the tapped serial line
 
-        // active framing configuration (same held level the transactors use)
-        input  wire [DIV_WIDTH-1:0]  cfg_divisor,
-        input  wire [3:0]            cfg_word_bits,
-        input  wire                  cfg_parity_en,
-        input  wire                  cfg_parity_even,
-        input  wire                  cfg_parity_stick,
-        input  wire [1:0]            cfg_stop_bits
+        // active divisor (same held level the transactors use)
+        input  wire [DIV_WIDTH-1:0]  cfg_divisor
     );
 
-    wire [BPW-1:0] bit_period = cfg_divisor * OVERSAMPLE;
+    wire [BPW-1:0] bit_period = BPW'(cfg_divisor) * BPW'(OVERSAMPLE);
 
     // ------------------------------------------------------------------------
     // Registered history (no $past), so the immediate-assert checkers are
@@ -68,11 +62,14 @@ module uart_proto_checker #(
     // The dwell check applies to DRIVEN bits. The line's pre-first-frame idle has no
     // minimum duration, so the very first transition out of post-reset idle is exempt
     // (a short reset->first-start gap is not a bit-period violation). seen_first arms
-    // the check once the first transition has occurred.
-    reg seen_first;
+    // the check once the first transition has occurred. A divisor change disarms it
+    // the same way: the run in progress was timed at the old rate.
+    reg                 seen_first;
+    reg [DIV_WIDTH-1:0] div_q;
     always @(posedge clock) begin
-        if (reset)        seen_first <= 1'b0;
-        else if (changed) seen_first <= 1'b1;
+        div_q <= cfg_divisor;
+        if (reset || cfg_divisor != div_q) seen_first <= 1'b0;
+        else if (changed)                  seen_first <= 1'b1;
     end
 
     // Dwell counter: how many cycles the line has held its current value. Reset to 1
@@ -101,6 +98,15 @@ module uart_proto_checker #(
         if (CHECK_STABILITY && changed && seen_first && (bit_period > 1))
             assert (hold >= bit_period);
     end
+
+`ifndef FORMAL
+    // Simulation: say what the stability check saw when it fires.
+    always @(posedge clock)
+        if (CHECK_STABILITY && changed && seen_first && (bit_period > 1) &&
+            (hold < bit_period))
+            $display("%m: line went %b after %0d clocks; a bit is %0d", line,
+                     hold, bit_period);
+`endif
 
     // ------------------------------------------------------------------------
     // Non-vacuity covers -- prove the interesting cases are reachable.

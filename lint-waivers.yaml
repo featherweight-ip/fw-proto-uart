@@ -1,0 +1,12 @@
+# Lint waivers for fw-proto-uart's own RTL. Held to zero findings; every
+# waiver must say why the finding is intended.
+waivers:
+- rule: PINCONNECTEMPTY
+  path: "tests/lint/uart_lint_top.sv"
+  reason: The lint top leaves the cores' link ports open on purpose.
+- rule: SYNCASYNCNET
+  path: "tests/lint/uart_lint_top.sv"
+  reason: >-
+    The cores reset asynchronously (kit convention); uart_proto_checker
+    samples reset as data, to check that the line is at mark during reset.
+    Both are on the one lint-top reset.

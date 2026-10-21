@@ -1,48 +1,50 @@
 `include "uart_xtor_macros.svh"
 
 // ----------------------------------------------------------------------------
-// UART Receive core transactor (pure module, signal-level ports)
+// UART receive core (pure module, signal-level ports)
 //
-// Bridges the asynchronous UART serial line (protocol side) to a ready/valid
-// character stream (FIFO side): it DESERIALIZES each frame off the line and emits
-// the recovered character plus its line-error status.
+// Deframes the serial input and puts each character, with its line status,
+// on the rsp link.
 //
-//   - rxd   : the serial input line (idle = mark = 1)
-//   - cfg_* : held runtime framing configuration (sampled at start-bit detect)
-//   - rsp_* : RV initiator port (core -> FIFO)  { data, status }
+//   rxd    : the serial input (idle = mark = 1), already synchronized
+//   tick   : the oversampling enable from uart_baud_xtor_core (K2). A bit is
+//            OVERSAMPLE ticks
+//   rsp_*  : ready/valid initiator (core -> link), { data, status }
+//   cfg_*  : framing, sampled at the start bit, so a change applies from the
+//            next character (K1). Only the first stop bit is checked, so the
+//            stop-bit count is not an input
 //
-// Timing: the receiver OVERSAMPLES -- the oversampling sub-tick is cfg_divisor
-// clocks, and one bit-period is OVERSAMPLE sub-ticks (§4.9). On the idle->start
-// (mark->space) edge it waits half a bit-period to the CENTER of the start bit,
-// re-confirms space, then samples every subsequent bit at its center (§5.1). It
-// checks only the first stop bit (§4.5). cfg_divisor == 0 disables reception.
+// Sampling: the line is looked at on ticks. The first tick that sees space
+// starts a character; each bit is then sampled once, OVERSAMPLE/2 ticks into
+// it (a single mid-bit sample, as the 16550 does). A start bit that is mark
+// again at its middle is a glitch, and the core goes back to idle.
 //
-// Line errors (§4.7): parity (PE), framing (FE: first stop not mark), break (BI:
-// full-frame space), overrun (OE: a completed character is dropped because the
-// FIFO has not accepted the previous one -- the only LOSSY UART behaviour).
+// Status (LSR-aligned, uart_xtor_macros.svh):
+//   PE  the parity bit does not match
+//   FE  the first stop bit is space
+//   BI  the whole frame was space: data 0, parity 0, stop 0 (K4). The
+//       character is delivered as data 0 with BI alone, and the core then
+//       waits for the line to return to mark before it looks for a start
+//       bit, so one break gives one character, as a 16550 does
+//   OE  characters were lost because the link had not taken the one before
+//       (single-entry output); set on the next character delivered
 // ----------------------------------------------------------------------------
 module uart_rx_xtor_core #(
         parameter int MAX_DATA_BITS = 8,
-        parameter int DIV_WIDTH = 16,
-        parameter int OVERSAMPLE = 16,
-        parameter int RSP_WIDTH  = MAX_DATA_BITS + 4,
-        parameter int BPW        = DIV_WIDTH + $clog2(OVERSAMPLE) + 1
+        parameter int OVERSAMPLE    = 16,
+        parameter int RSP_WIDTH     = MAX_DATA_BITS + 4
     ) (
         input  wire                     clock,
         input  wire                     reset,
+        input  wire                     tick,
 
-        // UART serial input (protocol) line
         input  wire                     rxd,
 
-        // Held runtime framing configuration
-        input  wire [DIV_WIDTH-1:0]     cfg_divisor,
         input  wire [3:0]               cfg_word_bits,
         input  wire                     cfg_parity_en,
         input  wire                     cfg_parity_even,
         input  wire                     cfg_parity_stick,
-        input  wire [1:0]               cfg_stop_bits,
 
-        // RV response channel (core drives, FIFO accepts) -- deframed char + status
         output wire [RSP_WIDTH-1:0]     rsp_dat,
         output wire                     rsp_valid,
         input  wire                     rsp_ready
@@ -50,139 +52,121 @@ module uart_rx_xtor_core #(
 
     typedef `UART_RX_RSP_S(MAX_DATA_BITS) rsp_s;
 
-    // Sample timing: half a bit to the start-bit center, then a full bit between
-    // subsequent bit centers.
-    wire [BPW-1:0] full_period = cfg_divisor * OVERSAMPLE;
-    wire [BPW-1:0] half_period = cfg_divisor * (OVERSAMPLE/2);
+    localparam int SW = $clog2(OVERSAMPLE);
+    localparam [SW-1:0] HALF_TICKS = SW'(OVERSAMPLE/2 - 1);
+    localparam [SW-1:0] BIT_TICKS  = SW'(OVERSAMPLE - 1);
 
     typedef enum logic [2:0] {
         IDLE   = 3'd0,
         START  = 3'd1,
         DATA   = 3'd2,
         PARITY = 3'd3,
-        STOP   = 3'd4
+        STOP   = 3'd4,
+        BREAK  = 3'd5       // after a break character: wait for mark
     } state_e;
 
-    state_e                state;
-    reg [BPW-1:0]          scnt;         // clocks down to the next sample point
-    reg [MAX_DATA_BITS-1:0] rxbuf;       // accumulated data bits (LSB-first)
-    reg [3:0]              bit_idx;       // next data bit to sample
-    reg                    rx_parity;     // sampled parity bit
+    state_e                 state;
+    reg [SW-1:0]            scnt;        // ticks to the next sample
+    reg [MAX_DATA_BITS-1:0] rxbuf;
+    reg [3:0]               bit_idx;
+    reg                     rx_parity;
+    reg [3:0]               wbits_q;
+    reg                     parity_en_q;
+    reg                     parity_even_q;
+    reg                     parity_stick_q;
 
-    // Output (single-entry) register + sticky overrun.
-    reg                    rsp_valid_r;
-    rsp_s                  rsp_q;
-    reg                    overrun_q;     // a char was dropped; flagged on next deliver
+    reg                     rsp_valid_r;
+    rsp_s                   rsp_q;
+    reg                     overrun_q;
 
     assign rsp_dat   = rsp_q;
     assign rsp_valid = rsp_valid_r;
 
-    wire rsp_fire    = rsp_valid_r && rsp_ready;
-    wire sample_tick = (state != IDLE) && (scnt == {BPW{1'b0}});
+    wire rsp_fire = rsp_valid_r && rsp_ready;
+    wire sample   = tick && (scnt == '0);
 
-    // Parity over the significant data bits (same definition as the transmitter).
     function automatic logic calc_parity(input logic [MAX_DATA_BITS-1:0] d,
-                                         input logic [3:0] wbits,
                                          input logic even, input logic stick);
-        logic [MAX_DATA_BITS-1:0] mask;
-        logic                     p;
-        mask = (wbits >= MAX_DATA_BITS) ? {MAX_DATA_BITS{1'b1}}
-                                        : ((1 << wbits) - 1);
-        p = ^(d & mask);
-        if (!even) p = ~p;
+        logic p;
+        p = ^d;                 // rxbuf is cleared at the start bit, so the
+        if (!even) p = ~p;      // bits above the word length are 0
         if (stick) p = ~even;
         return p;
     endfunction
 
-    // Frame-completion datapath (combinational), evaluated when STOP is sampled.
-    logic [MAX_DATA_BITS-1:0] data_masked;
-    logic                     exp_parity;
-    logic                     stop_ok;
-    logic                     is_break;
-    logic                     fe, pe;
-    always_comb begin
-        logic [MAX_DATA_BITS-1:0] mask;
-        mask        = (cfg_word_bits >= MAX_DATA_BITS) ? {MAX_DATA_BITS{1'b1}}
-                                                       : ((1 << cfg_word_bits) - 1);
-        data_masked = rxbuf & mask;
-        exp_parity  = calc_parity(rxbuf, cfg_word_bits,
-                                  cfg_parity_even, cfg_parity_stick);
-        stop_ok     = (rxd == 1'b1);                         // first stop = mark?
-        // break: the entire frame was space -- start + all data + parity + stop = 0
-        is_break    = (rxd == 1'b0) && (data_masked == 0) &&
-                      (!cfg_parity_en || (rx_parity == 1'b0));
-        fe          = (!stop_ok) && !is_break;               // framing error
-        pe          = cfg_parity_en && (rx_parity != exp_parity) && !is_break;
-    end
+    // At the stop-bit sample.
+    wire is_break = !rxd && (rxbuf == '0) && (!parity_en_q || !rx_parity);
+    wire fe       = !rxd && !is_break;
+    wire pe       = parity_en_q && !is_break &&
+                    (rx_parity != calc_parity(rxbuf, parity_even_q, parity_stick_q));
 
     always @(posedge clock or posedge reset) begin
         if (reset) begin
-            state       <= IDLE;
-            scnt        <= '0;
-            rxbuf       <= '0;
-            bit_idx     <= '0;
-            rx_parity   <= 1'b0;
-            rsp_valid_r <= 1'b0;
-            rsp_q       <= '0;
-            overrun_q   <= 1'b0;
+            state          <= IDLE;
+            scnt           <= '0;
+            rxbuf          <= '0;
+            bit_idx        <= '0;
+            rx_parity      <= 1'b0;
+            wbits_q        <= 4'd8;
+            parity_en_q    <= 1'b0;
+            parity_even_q  <= 1'b0;
+            parity_stick_q <= 1'b0;
+            rsp_valid_r    <= 1'b0;
+            rsp_q          <= '0;
+            overrun_q      <= 1'b0;
         end else begin
-            // up-link consume
             if (rsp_fire)
                 rsp_valid_r <= 1'b0;
 
-            // sample-point countdown
-            if (state != IDLE && scnt != 0)
+            if (tick && scnt != '0)
                 scnt <= scnt - 1'b1;
 
             case (state)
                 IDLE: begin
-                    // detect the start edge (line goes to space)
-                    if ((rxd == 1'b0) && (cfg_divisor != 0)) begin
+                    if (tick && !rxd) begin
+                        scnt  <= HALF_TICKS;
                         state <= START;
-                        scnt  <= (half_period == 0) ? '0 : (half_period - 1'b1);
                     end
                 end
                 START: begin
-                    if (sample_tick) begin
-                        if (rxd == 1'b1) begin
-                            state <= IDLE;          // false start (glitch)
+                    if (sample) begin
+                        if (rxd) begin
+                            state <= IDLE;
                         end else begin
-                            rxbuf   <= '0;
-                            bit_idx <= 4'd0;
-                            state   <= DATA;
-                            scnt    <= (full_period == 0) ? '0 : (full_period - 1'b1);
+                            rxbuf          <= '0;
+                            bit_idx        <= 4'd0;
+                            wbits_q        <= cfg_word_bits;
+                            parity_en_q    <= cfg_parity_en;
+                            parity_even_q  <= cfg_parity_even;
+                            parity_stick_q <= cfg_parity_stick;
+                            scnt           <= BIT_TICKS;
+                            state          <= DATA;
                         end
                     end
                 end
                 DATA: begin
-                    if (sample_tick) begin
-                        rxbuf[bit_idx] <= rxd;
-                        if ((bit_idx + 1) < cfg_word_bits) begin
-                            bit_idx <= bit_idx + 1'b1;
-                            scnt    <= (full_period == 0) ? '0 : (full_period - 1'b1);
-                        end else if (cfg_parity_en) begin
+                    if (sample) begin
+                        rxbuf[bit_idx[$clog2(MAX_DATA_BITS)-1:0]] <= rxd;
+                        scnt <= BIT_TICKS;
+                        if ((bit_idx + 4'd1) < wbits_q)
+                            bit_idx <= bit_idx + 4'd1;
+                        else if (parity_en_q)
                             state <= PARITY;
-                            scnt  <= (full_period == 0) ? '0 : (full_period - 1'b1);
-                        end else begin
+                        else
                             state <= STOP;
-                            scnt  <= (full_period == 0) ? '0 : (full_period - 1'b1);
-                        end
                     end
                 end
                 PARITY: begin
-                    if (sample_tick) begin
+                    if (sample) begin
                         rx_parity <= rxd;
+                        scnt      <= BIT_TICKS;
                         state     <= STOP;
-                        scnt      <= (full_period == 0) ? '0 : (full_period - 1'b1);
                     end
                 end
                 STOP: begin
-                    if (sample_tick) begin
-                        // Frame complete: assemble the result and try to deliver it.
-                        // If the up-link still holds an unconsumed character, drop
-                        // this one and remember the overrun for the next delivery.
+                    if (sample) begin
                         if (!rsp_valid_r || rsp_fire) begin
-                            rsp_q.data        <= is_break ? '0 : data_masked;
+                            rsp_q.data        <= rxbuf;
                             rsp_q.parity_err  <= pe;
                             rsp_q.framing_err <= fe;
                             rsp_q.brk         <= is_break;
@@ -190,10 +174,14 @@ module uart_rx_xtor_core #(
                             rsp_valid_r       <= 1'b1;
                             overrun_q         <= 1'b0;
                         end else begin
-                            overrun_q         <= 1'b1;   // character lost
+                            overrun_q         <= 1'b1;
                         end
-                        state <= IDLE;
+                        state <= is_break ? BREAK : IDLE;
                     end
+                end
+                BREAK: begin
+                    if (tick && rxd)
+                        state <= IDLE;
                 end
                 default: state <= IDLE;
             endcase

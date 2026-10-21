@@ -1,121 +1,101 @@
 // ======================================================================
-// Back-to-back FORMAL verification component for the UART kit (design §17).
+// Back-to-back formal harness: tx core -> line -> rx core, both driven by
+// one uart_baud_xtor_core, as a 16550 shares its divisor (K2).
 //
-// Wires the kit's two PROTOCOL CORES -- uart_tx_xtor_core (serializer) and
-// uart_rx_xtor_core (oversampling deframer) -- directly together over a shared serial
-// line and lets SymbiYosys prove the connection. The cores are the kit's real,
-// synthesizable RTL (clocked FSMs). UART is two one-way streams, so the harness drives
-// ONE free stream: a free CHARACTER producer into the transmitter's req-link, while
-// the receiver's up-link is freely drained.
+//   free src --req--> [tx core] --line--> [rx core] --rsp--> free snk
+//                          \---- tick ----/
 //
-//   free char src --req--> [tx core] --serial line--> [rx core] --rsp--> free sink
+// Framing and divisor are anyconst: any word length 5..8, any parity mode,
+// either stop setting, divisor 1 or 2. A frame at the real 16x rate is far
+// too deep for BMC, so OVERSAMPLE is 2 (a frame is 14..24 ticks); the
+// cores' timing is in ticks, so the shrink changes only the counts.
+// Break is held off (tx_brk_fv.sv covers it).
 //
-// THE DEPTH PROBLEM (design §17). A character crosses in frame_bits*OVERSAMPLE*divisor
-// cycles. At the real 16x rate this is >160 cycles -- far too deep for an end-to-end
-// BMC. So the proof runs at a SHRUNK rate: OVERSAMPLE=2, divisor=1 => bit period = 2
-// cycles, a frame ~24 cycles, which a modest BMC depth covers. The framing config is
-// tied to constants so both cores are baud-locked (matched-config assumption, O-3).
-//
-// (yosys cannot read SV structs/packages, so the flow runs this file + the cores
-// through sv2v -DFORMAL into plain Verilog first; see tests/formal/flow.yaml.)
-//
-// Run:  dfm run fw.proto.uart.fv
+// Properties: tests/formal/PROPERTIES.md.
 // ======================================================================
 module uart_proto_fv #(
-    parameter int MAX_DATA_BITS  = 8,
-    parameter int DIV_WIDTH  = 16,
-    parameter int OVERSAMPLE = 2,                 // shrunk for tractable BMC depth
-    parameter int RSP_WIDTH  = MAX_DATA_BITS + 4
+    parameter int MAX_DATA_BITS = 8,
+    parameter int OVERSAMPLE    = 2,
+    parameter int RSP_WIDTH     = MAX_DATA_BITS + 4
 ) (
-    input  wire                  clock,
-    input  wire                  reset,
-    // free CHARACTER producer feeding the transmitter's req-link
-    input  wire [MAX_DATA_BITS-1:0]  src_char,
-    input  wire                  src_valid,
-    // free sink draining the receiver's up-link
-    input  wire                  snk_ready
+    input  wire                     clock,
+    input  wire                     reset,
+    input  wire [MAX_DATA_BITS-1:0] src_char,
+    input  wire                     src_valid,
+    input  wire                     snk_ready
 );
-    // ---- baud-locked framing configuration (constants: 8N1, divisor 1) ----
-    localparam [DIV_WIDTH-1:0] CFG_DIV   = 1;
-    localparam [3:0]           CFG_WBITS = 8;
-    localparam                 CFG_PEN   = 1'b0;
-    localparam                 CFG_PEVEN = 1'b0;
-    localparam                 CFG_PSTK  = 1'b0;
-    localparam [1:0]           CFG_STOP  = 2'd0;
+    (* anyconst *) reg [1:0] f_div;
+    (* anyconst *) reg [3:0] f_wbits;
+    (* anyconst *) reg       f_pen, f_pev, f_pst;
+    (* anyconst *) reg [1:0] f_stop;
 
-    // ---- the shared serial line + internal link wires ----
-    wire                  txd;
-    wire                  tx_req_ready;            // tx req-link ready (to src)
-    wire [RSP_WIDTH-1:0]  rx_rsp_dat;              // rx up-link (to sink)
-    wire                  rx_rsp_valid;
+    wire                 tick;
+    wire                 txd;
+    wire                 tx_ready;
+    wire                 tx_busy;
+    wire [RSP_WIDTH-1:0] rx_dat;
+    wire                 rx_valid;
 
-    // transmitter core: req-link CONSUMER (from src), serial-line driver.
-    uart_tx_xtor_core #(
-        .MAX_DATA_BITS(MAX_DATA_BITS), .DIV_WIDTH(DIV_WIDTH), .OVERSAMPLE(OVERSAMPLE)
-    ) u_tx (
-        .clock(clock), .reset(reset),
-        .txd(txd),
-        .cfg_divisor(CFG_DIV), .cfg_word_bits(CFG_WBITS), .cfg_parity_en(CFG_PEN),
-        .cfg_parity_even(CFG_PEVEN), .cfg_parity_stick(CFG_PSTK), .cfg_stop_bits(CFG_STOP),
-        .req_dat(src_char), .req_valid(src_valid), .req_ready(tx_req_ready)
-    );
+    uart_baud_xtor_core #(.DIV_WIDTH(2)) u_baud (
+        .clock(clock), .reset(reset), .cfg_divisor(f_div), .tick(tick));
 
-    // receiver core: serial-line sampler, up-link PRODUCER (to sink).
-    uart_rx_xtor_core #(
-        .MAX_DATA_BITS(MAX_DATA_BITS), .DIV_WIDTH(DIV_WIDTH), .OVERSAMPLE(OVERSAMPLE)
-    ) u_rx (
-        .clock(clock), .reset(reset),
+    uart_tx_xtor_core #(.MAX_DATA_BITS(MAX_DATA_BITS), .OVERSAMPLE(OVERSAMPLE)) u_tx (
+        .clock(clock), .reset(reset), .tick(tick),
+        .txd(txd), .brk(1'b0), .busy(tx_busy),
+        .cfg_word_bits(f_wbits), .cfg_parity_en(f_pen), .cfg_parity_even(f_pev),
+        .cfg_parity_stick(f_pst), .cfg_stop_bits(f_stop),
+        .req_dat(src_char), .req_valid(src_valid), .req_ready(tx_ready));
+
+    uart_rx_xtor_core #(.MAX_DATA_BITS(MAX_DATA_BITS), .OVERSAMPLE(OVERSAMPLE)) u_rx (
+        .clock(clock), .reset(reset), .tick(tick),
         .rxd(txd),
-        .cfg_divisor(CFG_DIV), .cfg_word_bits(CFG_WBITS), .cfg_parity_en(CFG_PEN),
-        .cfg_parity_even(CFG_PEVEN), .cfg_parity_stick(CFG_PSTK), .cfg_stop_bits(CFG_STOP),
-        .rsp_dat(rx_rsp_dat), .rsp_valid(rx_rsp_valid), .rsp_ready(snk_ready)
-    );
+        .cfg_word_bits(f_wbits), .cfg_parity_en(f_pen), .cfg_parity_even(f_pev),
+        .cfg_parity_stick(f_pst),
+        .rsp_dat(rx_dat), .rsp_valid(rx_valid), .rsp_ready(snk_ready));
 
-    // The line-protocol invariants (reset -> mark; bit-period stability) are checked
-    // by the kit's reusable checker -- always on, so its immediate asserts become
-    // proof obligations. CHECK_STABILITY is disabled here: at the shrunk bit period
-    // (2 cycles) it is near-vacuous, and it is meaningfully exercised in the sim TB
-    // at the real oversampled rate (design §17). This harness adds the property the
-    // checker can't see: end-to-end DATA INTEGRITY.
-    uart_proto_checker #(
-        .OVERSAMPLE(OVERSAMPLE), .CHECK_STABILITY(1'b0)
-    ) u_chk (
+    // Line invariants (reset -> mark, bit-period stability), checked at the
+    // shrunk rate: every bit is exactly OVERSAMPLE * divisor clocks.
+    uart_proto_checker #(.OVERSAMPLE(OVERSAMPLE)) u_chk (
         .clock(clock), .reset(reset), .line(txd),
-        .cfg_divisor(CFG_DIV), .cfg_word_bits(CFG_WBITS), .cfg_parity_en(CFG_PEN),
-        .cfg_parity_even(CFG_PEVEN), .cfg_parity_stick(CFG_PSTK), .cfg_stop_bits(CFG_STOP)
-    );
+        .cfg_divisor({14'b0, f_div}));
 
 `ifdef FORMAL
-    // ---- preamble: mask first cycle, start in reset, then run ----
     reg f_past_valid = 1'b0;
     always @(posedge clock) f_past_valid <= 1'b1;
-    always @(*)             if (!f_past_valid) assume (reset);
-    always @(posedge clock) if (f_past_valid)  assume (!reset);
+    always @(*) if (!f_past_valid) assume (reset);
+    always @(posedge clock) if (f_past_valid) assume (!reset);
 
-    // handshake events
-    wire in_char  = src_valid    && tx_req_ready;   // a character enters the tx
-    wire out_char = rx_rsp_valid && snk_ready;      // a character leaves the rx
+    // Legal configuration.
+    always @(*) begin
+        assume (f_div == 2'd1 || f_div == 2'd2);
+        assume (f_wbits >= 4'd5 && f_wbits <= 4'd8);
+    end
 
-    // SRC LINK CONTRACT: a ready/valid producer holds valid+data stable while the
-    // consumer (the tx core) is not ready -- so the free source behaves like a real
-    // upstream FIFO and the tracked character is well-defined.
+    // The source holds valid and data until accepted (ready/valid).
     always @(posedge clock)
-        if (f_past_valid && !$past(reset))
-            if ($past(src_valid) && !$past(tx_req_ready)) begin
-                assume (src_valid);
-                assume (src_char == $past(src_char));
-            end
+        if (f_past_valid && !$past(reset) && $past(src_valid) && !$past(tx_ready)) begin
+            assume (src_valid);
+            assume (src_char == $past(src_char));
+        end
 
-    // DATA INTEGRITY end to end, via an arbitrary tracked position. One symbolic
-    // index proves all positions: the f_idx-th character the receiver delivers equals
-    // the f_idx-th character the transmitter accepted, with CLEAN status (matched
-    // config, clean line, no overrun since snk drains => no loss).
-    localparam int CW = 4;
+    // The sink takes a character within a frame, so nothing is lost; the
+    // overrun path is the rx harness's.
+    reg [5:0] f_stall;
+    always @(posedge clock)
+        if (reset || !rx_valid || snk_ready) f_stall <= '0;
+        else                                 f_stall <= f_stall + 1'b1;
+    always @(*) if (f_stall >= 6'd8) assume (snk_ready);
+
+    wire in_char  = src_valid && tx_ready;
+    wire out_char = rx_valid && snk_ready;
+
+    // (1) Integrity: the f_idx-th character delivered is the f_idx-th
+    //     accepted, masked to the word length, with clean status.
+    localparam int CW = 3;
     (* anyconst *) reg [CW-1:0] f_idx;
-
-    reg [CW-1:0]        in_cnt, out_cnt;
+    reg [CW-1:0]            in_cnt, out_cnt;
     reg [MAX_DATA_BITS-1:0] f_data;
-    reg                 f_have;
+    reg                     f_have;
 
     always @(posedge clock)
         if (reset) begin
@@ -128,19 +108,28 @@ module uart_proto_fv #(
             if (out_char) out_cnt <= out_cnt + 1'b1;
         end
 
-    // the f_idx-th delivered character equals the f_idx-th accepted, status clean
-    wire [MAX_DATA_BITS-1:0] rx_data   = rx_rsp_dat[RSP_WIDTH-1 -: MAX_DATA_BITS];
-    wire [3:0]           rx_status = rx_rsp_dat[3:0];
-    always @(posedge clock)
-        if (!reset)
-            if (out_char && (out_cnt == f_idx)) begin
-                assert (f_have);
-                assert (rx_data   == f_data);
-                assert (rx_status == 4'h0);
-            end
+    wire [MAX_DATA_BITS-1:0] mask    = MAX_DATA_BITS'((9'd1 << f_wbits) - 9'd1);
+    wire [MAX_DATA_BITS-1:0] rx_data = rx_dat[RSP_WIDTH-1 -: MAX_DATA_BITS];
+    wire [3:0]               rx_stat = rx_dat[3:0];
 
-    // non-vacuity: a tracked character actually traverses end to end
     always @(posedge clock)
-        cover (!reset && out_char && (out_cnt == f_idx) && f_have);
+        if (!reset && out_char && out_cnt == f_idx) begin
+            assert (f_have);
+            assert (rx_data == (f_data & mask));
+            assert (rx_stat == 4'h0);
+        end
+
+    // (2) Nothing arrives that was not sent.
+    always @(posedge clock)
+        if (!reset && out_char) assert (out_cnt != in_cnt || in_char);
+
+    // (3) The link handshake: ready when idle, or at the very end of the
+    //     stop bit (back-to-back frames).
+    always @(*) if (!reset && tx_ready && tx_busy) assert (tick);
+
+    always @(posedge clock) begin
+        cover (!reset && out_char && out_cnt == f_idx && f_have);
+        cover (!reset && out_char && out_cnt == 3'd1);
+    end
 `endif
 endmodule

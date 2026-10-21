@@ -1,71 +1,103 @@
 # yaml-language-server: $schema=https://dv-flow.github.io/flow.dv.schema.json
+#
+# Formal proofs of the kit's cores. The package-root roots point here:
+#   dfm run fv-quick    per push: the round trip at a shallow depth, and
+#                       the tx and rx break harnesses
+#   dfm run fv          nightly: the round trip deep enough for divisor 2
+#   dfm run fv-cover    reachability of the cover goals (non-vacuity)
+# See PROPERTIES.md for the spec -> invariant -> checker map.
+#
+# yosys's SV frontend rejects the cores' struct casts, so the cores and
+# harness go through sv2v first. --exclude=Assert is required: without it
+# sv2v drops every immediate assert, assume and cover, and the proof passes
+# vacuously.
 fragment:
-  # Unnamed fragment (see src/flow.yaml) -- tasks live under the package, e.g.
-  # fw.proto.uart.fv.
+  name: formal
+
   tasks:
-  # The kit's synthesizable cores + the protocol checker -- the only RTL the proof
-  # needs. The bundled yosys cannot read SV structs/packages, so the cores + harness
-  # are flattened to plain Verilog by sv2v (with -DFORMAL so the property block is
-  # included) before SymbiYosys reads them.
-  - name: cores
-    uses: std.FileSet
-    with:
-      type: systemVerilogSource
-      base: ${{ rootdir }}/src
-      incdirs:
-      - .
-      include:
-      - uart_tx_xtor_core.sv
-      - uart_rx_xtor_core.sv
-      - uart_proto_checker.sv
-
-  # The back-to-back harness source. Listed as a FileSet so edits to it (and to the
-  # cores) invalidate the sv2v step's cache and force a re-convert.
-  - name: fv-src
-    uses: std.FileSet
-    with:
-      type: systemVerilogSource
-      base: ${{ rootdir }}/tests/formal
-      include:
-      - uart_proto_fv.sv
-
-  # sv2v conversion step: cores + harness -> one yosys-readable .v. Emits a
-  # verilogSource FileSet (via dfm-out) that formal.sby.BMC consumes.
   - name: sv2v
-    needs: [cores, fv-src]
-    # Always re-convert: a stale conversion silently yields a vacuous/wrong proof.
     uptodate: false
     shell: bash
     run: |
       set -e
       OUT="$TASK_RUNDIR/uart_proto_fv.v"
-      # --exclude=Assert is REQUIRED: without it sv2v silently STRIPS every immediate
-      # assert/assume/cover, leaving a vacuous (always-passing) proof. -I src: the
-      # cores `include "uart_xtor_macros.svh".
-      sv2v --exclude=Assert -DFORMAL \
-        -I "${{ rootdir }}/src" \
+      sv2v --exclude=Assert -DFORMAL -I"${{ rootdir }}/src" \
+        "${{ rootdir }}/src/uart_baud_xtor_core.sv" \
         "${{ rootdir }}/src/uart_tx_xtor_core.sv" \
         "${{ rootdir }}/src/uart_rx_xtor_core.sv" \
         "${{ rootdir }}/src/uart_proto_checker.sv" \
         "${{ rootdir }}/tests/formal/uart_proto_fv.sv" > "$OUT"
       dfm-out fileset --filetype verilogSource --basedir "$TASK_RUNDIR" uart_proto_fv.v
 
-  # SymbiYosys BMC proof. depth 48 lets a character fully traverse the shrunk-rate
-  # serializer -> line -> deframer path (a frame is ~24 cycles at OVERSAMPLE=2,
-  # divisor=1) and be delivered, so the data-integrity tracker fires.
-  - root: fv
+  # Deep enough for two characters at divisor 1 and one at divisor 2.
+  - name: bmc
     uses: formal.sby.BMC
     needs: [sv2v]
     with:
       top: uart_proto_fv
-      depth: 48
+      depth: 64
 
-  # Cover (reachability / non-vacuity): proves every cover() statement (a tracked
-  # character traverses end to end; checker line covers) is reachable -- so the BMC
-  # pass above is not vacuous.
-  - root: fv-cover
+  # One character at divisor 1, any framing.
+  - name: bmc-quick
+    uses: formal.sby.BMC
+    needs: [sv2v]
+    with:
+      top: uart_proto_fv
+      depth: 32
+
+  - name: cover
     uses: formal.sby.Cover
     needs: [sv2v]
     with:
       top: uart_proto_fv
-      depth: 48
+      depth: 64
+
+  - name: sv2v-txbrk
+    uptodate: false
+    shell: bash
+    run: |
+      set -e
+      OUT="$TASK_RUNDIR/uart_txbrk_fv.v"
+      sv2v --exclude=Assert -DFORMAL -I"${{ rootdir }}/src" \
+        "${{ rootdir }}/src/uart_tx_xtor_core.sv" \
+        "${{ rootdir }}/tests/formal/uart_txbrk_fv.sv" > "$OUT"
+      dfm-out fileset --filetype verilogSource --basedir "$TASK_RUNDIR" uart_txbrk_fv.v
+
+  - name: bmc-txbrk
+    uses: formal.sby.BMC
+    needs: [sv2v-txbrk]
+    with:
+      top: uart_txbrk_fv
+      depth: 30
+
+  - name: cover-txbrk
+    uses: formal.sby.Cover
+    needs: [sv2v-txbrk]
+    with:
+      top: uart_txbrk_fv
+      depth: 30
+
+  - name: sv2v-rxbrk
+    uptodate: false
+    shell: bash
+    run: |
+      set -e
+      OUT="$TASK_RUNDIR/uart_rxbrk_fv.v"
+      sv2v --exclude=Assert -DFORMAL -I"${{ rootdir }}/src" \
+        "${{ rootdir }}/src/uart_rx_xtor_core.sv" \
+        "${{ rootdir }}/tests/formal/uart_rxbrk_fv.sv" > "$OUT"
+      dfm-out fileset --filetype verilogSource --basedir "$TASK_RUNDIR" uart_rxbrk_fv.v
+
+  - name: bmc-rxbrk
+    uses: formal.sby.BMC
+    needs: [sv2v-rxbrk]
+    with:
+      top: uart_rxbrk_fv
+      depth: 40
+
+  - name: cover-rxbrk
+    uses: formal.sby.Cover
+    needs: [sv2v-rxbrk]
+    with:
+      top: uart_rxbrk_fv
+      depth: 40

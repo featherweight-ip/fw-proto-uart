@@ -1,83 +1,79 @@
 # Getting started
 
-## Prerequisites
+## Build and run
 
-The kit builds and runs through [DV Flow Manager](https://github.com/dv-flow/dv-flow-mgr)
-(`dfm`). The toolchain (Verilator for simulation, yosys + SymbiYosys + sv2v for formal)
-is pulled in via `ivpm.yaml`. From the package root:
+The kit builds with [DV Flow Manager](https://github.com/dv-flow/dv-flow-mgr)
+(`dfm`) on the `project.dv` archetype. `ivpm update` (dep-set `dev`) fetches
+the toolchain: Verilator for simulation, and yosys, SymbiYosys and sv2v for
+formal. From the package root:
 
 ```bash
-dfm run fw.proto.uart.uart-proto    # back-to-back simulation  -> [uart_proto] PASS
-dfm run fw.proto.uart.fv            # SymbiYosys BMC proof      -> DONE (PASS)
-dfm run fw.proto.uart.fv-cover      # cover reachability        -> DONE (PASS)
+dfm run tests        # uart-proto, uart-proto-os4, uart-proto-err
+dfm run lint-rtl     # zero findings
+dfm run fv-quick     # per-push BMC (~30 s)
+dfm run fv           # nightly BMC
+dfm run fv-cover     # cover goals
 ```
 
-## The back-to-back simulation test
+Each sim prints `[uart_proto] PASS (OVERSAMPLE n, k checks)`, and `$fatal`s
+on any error.
 
-`tests/uart_proto_tb.sv` wires a full **TX transactor** to a full **RX transactor**
-over one shared serial line, taps a **monitor**, and runs the kit's protocol checker
-on the line. It exercises:
-
-- end-to-end integrity across framings: **8N1, 7E1, 8O1, 5-bit/2-stop, 8-bit stick**;
-- a **parity error** (TX even / RX odd) → the `PE` status bit;
-- a **framing error** and a **break** (bit-banged frames with a space stop / all-space);
-- **overrun** (a stalled receive sink overflows the RX FIFO; the `OE` bit is flagged and
-  characters are dropped — the one lossy UART behaviour);
-- the **monitor** observing every framed character on the tapped line.
-
-Expected console result: `[uart_proto] PASS`.
-
-## Using the kit in your own testbench
-
-Instance the transactors, build the bridges + your models, wire them by handle, then
-`start()` the consumer bridges:
+## A first testbench
 
 ```systemverilog
-import fw_proto_uart_pkg::*;
+module my_tb;
+    import fw_proto_uart_pkg::*;
 
-// 1. signal-level transactors on a shared line
-wire txd;
-uart_tx_xtor      u_tx  (.clock(clk), .reset(rst), .txd(txd));
-uart_rx_xtor      u_rx  (.clock(clk), .reset(rst), .rxd(txd));
-uart_monitor_xtor u_mon (.clock(clk), .reset(rst), .line(txd));
+    logic clk = 0, rst = 1;
+    always #5ns clk = ~clk;
+    initial begin repeat (3) @(posedge clk); rst = 0; end
 
-// 2. a host sink that consumes received characters
-class my_sink implements uart_rx_if;
-    virtual task recv(input [7:0] data, input [3:0] status);
-        $display("rx: 0x%02h status=0x%1h", data, status);
-    endtask
-endclass
+    wire line;
+    uart_tx_xtor u_tx (.clock(clk), .reset(rst), .txd(line));
+    uart_rx_xtor u_rx (.clock(clk), .reset(rst), .rxd(line));
 
-initial begin
-    automatic uart_tx_xtor_bridge tx  = new(u_tx.u_if);
-    automatic my_sink             snk = new();
-    automatic uart_rx_xtor_bridge rx  = new(u_rx.u_if, snk);
+    class my_sink implements uart_rx_if;
+        virtual task recv(input bit [7:0] data, input bit [3:0] status);
+            $display("rx 0x%02h status %b", data, status);   // {OE, BI, FE, PE}
+        endtask
+    endclass
 
-    // 3. configure both ends to the same framing (8N1, divisor 2)
-    tx.configure(16'd2, 4'd8, 1'b0, 1'b0, 1'b0, 2'd0);
-    rx.configure(16'd2, 4'd8, 1'b0, 1'b0, 1'b0, 2'd0);
+    uart_tx_xtor_bridge tx;
+    uart_rx_xtor_bridge rx;
 
-    // 4. start the consumer loop, then transmit
-    rx.start();
-    tx.send(8'h41);   // 'A'
-    tx.send(8'h42);   // 'B'
-end
+    initial begin
+        my_sink sink = new();
+        tx = new(u_tx.u_if);
+        rx = new(u_rx.u_if, sink);
+        @(negedge rst);
+        rx.start_bridge();
+
+        // 8N1, divisor 4: a bit is 16 * 4 clocks
+        tx.configure(16'd4, 4'd8, 1'b0, 1'b0, 1'b0, 2'd0);
+        rx.configure(16'd4, 4'd8, 1'b0, 1'b0, 1'b0, 2'd0);
+
+        tx.send(8'h41);
+        tx.send_break(2);
+        tx.send(8'h42);
+        repeat (5000) @(posedge clk);
+        $finish;
+    end
+endmodule
 ```
 
-`send()` blocks only until the character is accepted into the TX FIFO; the frame then
-shifts out on the line. The RX bridge's `run()` loop deframes each character and calls
-your sink's `recv()`. To pull characters directly (without a sink), call
-`u_rx.u_if.recv(data, status)` on the transactor interface.
+It prints `0x41`, then `0x00` with BI (`0100`), then `0x42`. The consumer
+skill (`skills/fw-proto-uart/SKILL.md`) has the dv-flow setup, the monitor,
+error injection, and the cores used directly in a design.
 
-## Configuration arguments
+## `configure()` arguments
 
-`configure(divisor, word_bits, parity_en, parity_even, parity_stick, stop_bits)`:
-
-| Argument | Meaning |
+| Argument | Meaning (16550 field) |
 | --- | --- |
-| `divisor` | baud divider; one bit period = `OVERSAMPLE * divisor` system clocks (`0` disables I/O) |
-| `word_bits` | data bits per character, `5`..`8` |
-| `parity_en` | `1` = a parity bit is generated/checked |
-| `parity_even` | `1` = even parity, `0` = odd |
-| `parity_stick` | `1` = stick parity (parity forced to a fixed level) |
-| `stop_bits` | `0` ⇒ 1 stop bit; `1` ⇒ 1.5 (5-bit char) / 2 stop bits |
+| `divisor` | clocks per tick; a bit is `OVERSAMPLE` ticks; 0 stops the line (DLL/DLM) |
+| `word_bits` | data bits, 5..8 (LCR[1:0] + 5) |
+| `parity_en` | a parity bit is sent and checked (LCR[3]) |
+| `parity_even` | even parity; 0 = odd (LCR[4]) |
+| `parity_stick` | the parity bit is fixed at `!parity_even` (LCR[5]) |
+| `stop_bits` | 0 = 1 stop bit; otherwise 2, or 1.5 with 5-bit words (LCR[2]) |
+
+Configure tx, rx and monitor alike, between characters.

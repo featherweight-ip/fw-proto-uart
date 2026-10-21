@@ -1,58 +1,50 @@
-# fw-proto-uart — UART Protocol Kit
+# fw-proto-uart: UART protocol kit
 
-A [Featherweight-HDL](https://github.com/featherweight-hdl) **protocol kit** that
-bridges a clean, method-level API to the signal-level **UART line protocol**. Test,
-model, and verification code calls blocking transfer methods on a SystemVerilog
-`interface class`, while per-role transactors serialize and deserialize the real
-serial line. A passive protocol checker enforces the line invariants, and a
-back-to-back simulation test plus SymbiYosys formal proofs keep the kit honest.
+A [Featherweight-HDL](https://github.com/featherweight-hdl) **protocol kit**
+that connects class-level transmit, receive and monitor APIs to an
+asynchronous serial line with 16550-style framing. Test, model and VIP code
+calls methods on SystemVerilog `interface class`es, and per-role
+transactors drive and sample the line. A passive checker enforces the line
+invariants; back-to-back sims and SymbiYosys proofs check the cores.
 
 ```{admonition} Status
 :class: tip
-The kit builds green: the back-to-back simulation test (`uart-proto`) passes
-(`[uart_proto] PASS`), the SymbiYosys BMC proof (`fv`) completes with
-`DONE (PASS)`, and the cover-reachability proof (`fv-cover`, non-vacuity) reaches
-every cover. The data-integrity proof is mutation-checked (a corrupted byte makes
-the proof fail).
+tx, rx and monitor, with framing set at run time (5 to 8 bits; parity none,
+odd, even, stick 0 or stick 1; 1, 1.5 or 2 stop bits). One shared baud tick
+core (K2). Break as a level and as a timed clean break, with one BI
+character per break (K4). VIP-side error injection: bad parity, bad stop,
+baud offset, glitches (K6). The sims (`uart-proto`, `uart-proto-os4`,
+`uart-proto-err`) pass. The BMC proofs (`fv-quick`, `fv`) pass, and
+`fv-cover` reaches every cover goal. Lint has zero findings.
 ```
 
-## What UART is, in one paragraph
+## UART in one paragraph
 
-UART is an **asynchronous serial line protocol**: there is no shared clock. A
-transmitter (TX) serializes a character into a *frame* — a start bit (space),
-5–8 data bits LSB-first, an optional parity bit, and 1–2 stop bits (mark) — driving
-one bit per *bit period*. A receiver (RX) **oversamples** the line, finds the start
-edge, samples each bit at its center, and recovers the character plus its line-error
-status (parity / framing / break / overrun). The two directions are independent
-simplex streams. The framing is **runtime-configurable** (baud divisor, word length,
-parity, stop bits). See {doc}`uart-characterization` for the full analysis.
+UART is an asynchronous serial line: there is no shared clock. A
+transmitter sends each character as a frame: a start bit (space), 5 to 8
+data bits LSB first, an optional parity bit, and 1, 1.5 or 2 stop bits
+(mark). A receiver oversamples the line, finds the start edge, samples each
+bit in its middle, and reports the character with its line status (parity,
+framing, break, overrun). The two directions are independent one-way
+streams.
 
 ## The roles
 
-Each role is a full transactor — a clocked signal-level **core**, a hand-coded
-synthesizable **interface** (FIFOs + held config + blocking task API), a **wrapper**
-module binding the two, and a plain-class **bridge** that connects the transactor to
-the method API.
-
-| Role | API it speaks | Drives / observes | Bridge role |
+| Role | API | Line | Bridge |
 | --- | --- | --- | --- |
-| **TX** | `uart_tx_if` — `send(data)` | serializes onto `txd` | provider (implements API) |
-| **RX** | `uart_rx_if` — `recv(data, status)` | oversamples `rxd` | consumer (holds a sink, `start()`s) |
-| **monitor** | `uart_monitor_if` — `observe(...)` | taps a line, drives nothing | consumer (holds a subscriber, `start()`s) |
+| **tx** | `uart_tx_if`: `send`, `set_break`, `send_break`; `uart_tx_inject_if`: `send_err`, `glitch` | drives `txd` | provider (implements the APIs) |
+| **rx** | `uart_rx_if`: `recv(data, status)` | samples `rxd` | consumer (holds a sink; `start_bridge()`) |
+| **monitor** | `uart_monitor_if`: `observe(data, status, is_tx)` | taps a line | consumer (holds a subscriber; `start_bridge()`) |
 
-UART's roles are **asymmetric one-way** streams (TX only sends, RX only receives;
-there is no wire-level response), so unlike a request/response bus each role has its
-own one-way API. All three roles also speak `uart_config_if` — `configure(...)` —
-to set the runtime framing.
+All three also implement `uart_config_if.configure(...)`.
 
 ## Where to start
 
-- New here? Read the {doc}`overview` for the design, then {doc}`getting-started`
-  to build and run the demonstrators.
-- Writing code against the kit? See the {doc}`api-reference`.
-- Curious how it stays synthesizable and provable? See {doc}`verification` and
-  {doc}`protocol-property-checking`.
-- Want the protocol analysis the kit was built from? See {doc}`uart-characterization`.
+- {doc}`overview`: how the kit is built, and the 16550-driven choices.
+- {doc}`getting-started`: build, run, and a first testbench.
+- {doc}`api-reference`: every API, bridge and core port.
+- {doc}`verification` and {doc}`protocol-property-checking`: what is
+  checked, and how.
 
 ```{toctree}
 :maxdepth: 2
@@ -63,5 +55,4 @@ getting-started
 api-reference
 verification
 protocol-property-checking
-uart-characterization
 ```

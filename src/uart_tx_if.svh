@@ -1,18 +1,22 @@
-// UART transmit API -- the one-way TRANSMIT operation (initiator archetype).
-// UART's TX and RX are asymmetric simplex streams with no wire-level response, so
-// the transmit side has its own one-way API (there is no unified transfer API; see
-// docs/uart-characterization.md §2/§8).
-//
-// PROVIDER: the uart_tx_xtor_bridge IMPLEMENTS send(); a driver calls it to enqueue
-// one character. send() blocks only until the character is accepted into the TX
-// FIFO (caller-side pipelining); the frame then shifts out on the serial line.
-//
-//   data : the character to transmit. Carried as MAX_DATA_BITS (8); the low
-//          cfg_word_bits (5..8) are significant -- the upper bits are ignored by
-//          the serializer (design O-4).
+// UART transmit API (initiator). UART's two directions are independent
+// one-way streams with no response on the wire, so transmit has its own
+// API. Implemented by uart_tx_xtor_bridge.
 interface class uart_tx_if;
 
-    // Enqueue one character for transmission (blocking until accepted).
-    pure virtual task send(input [7:0] data);
+    // Queue one character. Blocks until the transactor accepts it; the
+    // frame then goes out on the line. The low cfg word_bits (5..8) are
+    // sent; the bits above are ignored.
+    pure virtual task send(input bit [7:0] data);
+
+    // Break as a level (16550 LCR.BC, K4). on=1 drives the line to space at
+    // once and holds back further characters; on=0 releases it. A character
+    // already on the line when on=1 is lost, as in a 16550.
+    pure virtual task set_break(input bit on);
+
+    // A clean break of n_chars character times (at the current framing):
+    // waits for everything queued to go out, drives space, then releases.
+    // After any break the core holds mark for one bit before the next
+    // character starts.
+    pure virtual task send_break(input int unsigned n_chars);
 
 endclass

@@ -1,11 +1,17 @@
 # yaml-language-server: $schema=https://dv-flow.github.io/flow.dv.schema.json
+#
+# Unnamed fragment (see src/flow.yaml): tasks live under the package, e.g.
+# fw.proto.uart.uart-proto.
+#
+# Back-to-back sims (K9): tx -> line -> rx, with a monitor on the line
+# (uart_proto_tb.sv). A case is image -> run (`mode: test`, so a failure
+# does not abort the suite) -> check (verdict from the exit code: the bench
+# $fatals on any error). The check carries the std.Test tag `tests` and
+# `smoke` select on. The image defines UART_PROTO_SVA, so the checker's
+# concurrent layer runs too.
 fragment:
-  # Unnamed fragment (see src/flow.yaml) -- tasks live under the package, e.g.
-  # fw.proto.uart.uart-proto.
   tasks:
-  # REQUIRED back-to-back simulation test (design §16): drives the full kit stack
-  # (TX -> serial line -> RX + monitor) and checks round-trip integrity across
-  # framings, parity/framing/break errors, overrun, and monitor observation.
+  # Framing, divisors, timing, break and overrun at OVERSAMPLE 16.
   - name: uart-proto-tb
     uses: std.FileSet
     with:
@@ -16,14 +22,98 @@ fragment:
       - .
 
   - name: uart-proto-img
-    uses: hdlsim.vlt.SimImage
-    needs: [files, uart-proto-tb]
+    uses: hdlsim.SimImage
+    needs: [files, uart-proto-tb, flags-img]
     with:
+      sim: "${{ sim }}"
       top: [uart_proto_tb]
-      # exercise the protocol checker's concurrent-SVA layer in sim too
       defines:
       - UART_PROTO_SVA
 
-  - root: uart-proto
-    uses: hdlsim.vlt.SimRun
-    needs: [uart-proto-img]
+  - name: uart-proto-run
+    uses: hdlsim.SimRun
+    needs: [uart-proto-img, "flags-run-${{ build }}"]
+    with:
+      sim: "${{ sim }}"
+      mode: test
+
+  - name: uart-proto
+    uses: hdlsim.SimCheck
+    needs: [uart-proto-run]
+    rundir: inherit
+    with:
+      name: uart_proto
+    tags:
+    - std.Test: {name: uart_proto}
+
+  # Both groups at OVERSAMPLE 4.
+  - name: uart-proto-os4-tb
+    uses: std.FileSet
+    with:
+      type: systemVerilogSource
+      include:
+      - uart_proto_tb.sv
+      - uart_proto_os4_tb.sv
+      incdirs:
+      - .
+
+  - name: uart-proto-os4-img
+    uses: hdlsim.SimImage
+    needs: [files, uart-proto-os4-tb, flags-img]
+    with:
+      sim: "${{ sim }}"
+      top: [uart_proto_os4_tb]
+      defines:
+      - UART_PROTO_SVA
+
+  - name: uart-proto-os4-run
+    uses: hdlsim.SimRun
+    needs: [uart-proto-os4-img, "flags-run-${{ build }}"]
+    with:
+      sim: "${{ sim }}"
+      mode: test
+
+  - name: uart-proto-os4
+    uses: hdlsim.SimCheck
+    needs: [uart-proto-os4-run]
+    rundir: inherit
+    with:
+      name: uart_proto_os4
+    tags:
+    - std.Test: {name: uart_proto_os4}
+
+  # Error injection (K6) at OVERSAMPLE 16.
+  - name: uart-proto-err-tb
+    uses: std.FileSet
+    with:
+      type: systemVerilogSource
+      include:
+      - uart_proto_tb.sv
+      - uart_proto_err_tb.sv
+      incdirs:
+      - .
+
+  - name: uart-proto-err-img
+    uses: hdlsim.SimImage
+    needs: [files, uart-proto-err-tb, flags-img]
+    with:
+      sim: "${{ sim }}"
+      top: [uart_proto_err_tb]
+      defines:
+      - UART_PROTO_SVA
+
+  - name: uart-proto-err-run
+    uses: hdlsim.SimRun
+    needs: [uart-proto-err-img, "flags-run-${{ build }}"]
+    with:
+      sim: "${{ sim }}"
+      mode: test
+
+  - name: uart-proto-err
+    uses: hdlsim.SimCheck
+    needs: [uart-proto-err-run]
+    rundir: inherit
+    with:
+      name: uart_proto_err
+    tags:
+    - std.Test: {name: uart_proto_err}

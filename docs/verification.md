@@ -1,64 +1,61 @@
 # Verification
 
-The kit ships two complementary proofs of correctness: a **back-to-back simulation**
-test that exercises the full stack, and a **back-to-back formal** proof of the
-synthesizable cores. A passive protocol checker runs in both.
+Back-to-back sims check the whole stack, formal proofs check the cores,
+and `uart_proto_checker` runs in both.
 
-## Back-to-back simulation (`uart-proto`)
+## Simulation (K9)
 
-`tests/uart_proto_tb.sv` wires a full TX transactor to a full RX transactor over one
-shared line, taps a monitor, and instantiates the checker (with `UART_PROTO_SVA`
-defined so the concurrent-SVA layer also runs). It proves end-to-end character
-integrity across framings, the full line-error taxonomy (parity / framing / break /
-overrun), and monitor observation, through the real FIFO + bridge + class-API stack.
+`tests/uart_proto_tb.sv` drives a tx transactor into an rx transactor over
+one line, with a monitor on the line. Every character the sink receives is
+checked against what was sent, and the monitor must report the same
+character and status as the receiver. The checker watches the tx core's
+output, and the image defines `UART_PROTO_SVA`, so its concurrent layer
+runs too.
 
-```bash
-dfm run fw.proto.uart.uart-proto      # expect: [uart_proto] PASS
-```
-
-This is the layer the formal proof cannot reach: the FIFO depth/ordering, the
-bridge `run()` loops, the blocking `send`/`recv` semantics, and the held-config path.
-
-## Back-to-back formal (`fv`, `fv-cover`)
-
-`tests/formal/uart_proto_fv.sv` wires the two **cores** — `uart_tx_xtor_core` and
-`uart_rx_xtor_core` — directly together over the serial line, free-drives the TX
-character stream, freely drains the RX up-link, and instantiates the checker. It adds
-the property the checker can't see: **end-to-end data integrity** via an `anyconst`
-tracked position — the `f_idx`-th character the receiver delivers equals the `f_idx`-th
-the transmitter accepted, with clean status.
+| Case | OVERSAMPLE | Checks |
+| --- | --- | --- |
+| `uart-proto` | 16 | 11 framings (5 to 8 bits; parity none, odd, even, stick 0, stick 1; 1, 1.5, 2 stop) at divisors 1, 2, 3, back to back; start-bit width and character period exact to the clock; parity mismatch; `send_break` of 1 and 3 characters (one BI each); the `set_break` level with a character waiting behind it; overrun; divisor 0 |
+| `uart-proto-err` | 16 | error injection (K6): bad parity, bad stop, both; a bad stop followed by a frame at +3%; order kept around injected frames; ±3% baud received clean; ±8% must not be; an idle glitch of 3/8 bit rejected; a glitch over the middle of a data bit flips it, one off the middle does not |
+| `uart-proto-os4` | 4 | both groups |
 
 ```bash
-dfm run fw.proto.uart.fv          # BMC of all asserts   -> DONE (PASS)
-dfm run fw.proto.uart.fv-cover    # cover reachability   -> DONE (PASS)
+dfm run tests      # all three; `smoke` is the same set
 ```
 
-### The depth problem and how it's handled
+## Formal
 
-A character crosses in `frame_bits × OVERSAMPLE × divisor` cycles — over 160 at the
-real 16× rate, far too deep for an end-to-end BMC. The formal harness therefore runs
-at a **shrunk rate**: `OVERSAMPLE=2`, `divisor=1` (bit period = 2 cycles, a frame ~24
-cycles), and ties the framing config to constants so both cores are baud-locked. BMC
-depth 48 lets a character fully traverse and the integrity tracker fire.
+Three harnesses in `tests/formal`, each through `sv2v --exclude=Assert
+-DFORMAL` and SymbiYosys:
 
-### Non-vacuity and teeth
+- `uart_proto_fv`: tx core → line → rx core on one shared baud tick, with
+  any framing and divisor 1 or 2 (`anyconst`), at `OVERSAMPLE = 2`. It
+  checks data integrity of the k-th character, no spurious characters, the
+  handshake, and the checker's line rules.
+- `uart_txbrk_fv`: the tx core with a free tick and a free break level.
+  Break gives space at once and holds characters back; a clean break is
+  followed by a bit of mark; bit edges fall on ticks.
+- `uart_rxbrk_fv`: the rx core on a free line. A BI character is data 0
+  with BI alone; one break gives one character; status is consistent.
 
-A green BMC (asserts hold) **and** a green Cover (every `cover()` reachable — including
-the end-to-end traversal of a tracked character) together rule out a vacuous proof. The
-proof is also **mutation-checked**: corrupting a delivered data bit in the RX core makes
-the BMC fail, confirming the data-integrity assert has teeth.
+The property table, depths, cover goals and the mutation checks are in
+`tests/formal/PROPERTIES.md`.
 
-### Toolchain note
+```bash
+dfm run fv-quick   # per push
+dfm run fv         # nightly
+dfm run fv-cover   # every cover goal reached
+```
 
-The bundled yosys cannot read SV structs/packages, so the cores + harness are flattened
-to plain Verilog by `sv2v --exclude=Assert -DFORMAL` before SymbiYosys reads them.
-`--exclude=Assert` is **mandatory** — without it sv2v silently strips every assertion and
-the proof passes vacuously.
+`--exclude=Assert` is required: without it sv2v drops every immediate
+assert, assume and cover, and the proof passes vacuously.
 
-## The protocol checker
+## Teeth
 
-`uart_proto_checker.sv` is a passive module (line + config inputs only) that can be
-bound to any UART line. It enforces the line invariants in two layers — a synthesizable
-immediate-assert layer (always on, read directly by yosys and any simulator) and a
-concurrent-SVA layer (`UART_PROTO_SVA`, richer sim checks). See
-{doc}`protocol-property-checking` for the rule-by-rule catalogue.
+Four mutations were each put into a copy of the kit (no mark wait in rx,
+no post-break mark in tx, a gap between frames, odd parity computed as
+even). Each one fails a sim, a proof, or both (PROPERTIES.md, "Teeth").
+
+## CI
+
+`ci/run.sh` runs the checks on either forge (`.github`, `.forgejo`): push
+runs `smoke lint-rtl fv-quick`; nightly runs `tests lint-rtl fv fv-cover`.

@@ -1,44 +1,52 @@
 `include "uart_xtor_macros.svh"
 
 // ----------------------------------------------------------------------------
-// UART Transmit core transactor (pure module, signal-level ports)
+// UART transmit core (pure module, signal-level ports)
 //
-// Bridges a ready/valid character stream (FIFO side) to the asynchronous UART
-// serial line (protocol side): it SERIALIZES each accepted character into a frame
-// -- start bit (space), cfg_word_bits data bits LSB-first, an optional parity bit,
-// then cfg_stop_bits worth of stop bits (mark) -- driving one bit per bit-period.
+// Serializes each character accepted on the req link into a frame: a start
+// bit (space), cfg_word_bits data bits LSB first, an optional parity bit,
+// and the stop bits (mark).
 //
-//   - req_* : RV target port (FIFO -> core)  { data }   the character to send
-//   - txd   : the serial output line (idle = mark = 1)
-//   - cfg_* : held runtime framing configuration (sampled at frame start)
+//   req_*  : ready/valid target (link -> core), { data }
+//   txd    : the serial output (idle = mark = 1)
+//   tick   : the oversampling enable from uart_baud_xtor_core (K2). A bit is
+//            OVERSAMPLE ticks; every bit edge is on a tick, so each bit is
+//            exactly OVERSAMPLE * divisor clocks
+//   brk    : break (K4, 16550 LCR.BC), a level. While it is 1, txd is 0 at
+//            once and no new character is accepted. A character already
+//            started carries on underneath and is lost, as in a 16550;
+//            characters behind it wait on the link (OI-10). After brk
+//            falls the line holds mark for one bit before the next start
+//            bit, so a receiver sees the break end. Raise it with busy = 0
+//            for a clean break
+//   busy   : a character is in the core (16550 LSR.TEMT = !busy and the
+//            FIFO empty). req_ready and busy are both 1 only on the tick
+//            that ends a stop bit
+//   cfg_*  : framing, sampled when a character is accepted, so a change
+//            applies from the next character (K1)
 //
-// Bit timing: one bit-period = OVERSAMPLE * cfg_divisor system clocks (§4.9). The
-// transmitter does not oversample (only the receiver does); it counts whole
-// bit-periods. cfg_divisor == 0 disables transmission (the line idles at mark).
+// Stop bits: cfg_stop_bits == 0 gives 1; otherwise 2, or 1.5 for a 5-bit
+// character.
 // ----------------------------------------------------------------------------
 module uart_tx_xtor_core #(
         parameter int MAX_DATA_BITS = 8,
-        parameter int DIV_WIDTH = 16,
-        parameter int OVERSAMPLE = 16,
-        parameter int REQ_WIDTH  = MAX_DATA_BITS,
-        // bit-period counter width: max bit-period = (2^DIV_WIDTH-1)*OVERSAMPLE
-        parameter int BPW        = DIV_WIDTH + $clog2(OVERSAMPLE) + 1
+        parameter int OVERSAMPLE    = 16,
+        parameter int REQ_WIDTH     = MAX_DATA_BITS
     ) (
         input  wire                     clock,
         input  wire                     reset,
+        input  wire                     tick,
 
-        // UART serial output (protocol) line
         output wire                     txd,
+        input  wire                     brk,
+        output wire                     busy,
 
-        // Held runtime framing configuration
-        input  wire [DIV_WIDTH-1:0]     cfg_divisor,
         input  wire [3:0]               cfg_word_bits,
         input  wire                     cfg_parity_en,
         input  wire                     cfg_parity_even,
         input  wire                     cfg_parity_stick,
         input  wire [1:0]               cfg_stop_bits,
 
-        // RV request channel (FIFO drives, core accepts) -- the character to send
         input  wire [REQ_WIDTH-1:0]     req_dat,
         input  wire                     req_valid,
         output wire                     req_ready
@@ -46,141 +54,148 @@ module uart_tx_xtor_core #(
 
     typedef `UART_TX_REQ_S(MAX_DATA_BITS) req_s;
 
-    req_s req_u;
-    always_comb req_u = req_s'(req_dat);
+    // Ticks left in the current bit; the longest is two stop bits.
+    localparam int TW = $clog2(2*OVERSAMPLE);
+    localparam [TW-1:0] BIT_TICKS  = TW'(OVERSAMPLE - 1);
+    localparam [TW-1:0] BRK_MARK   = TW'(OVERSAMPLE);      // see IDLE
+    localparam [TW-1:0] STOP1      = TW'(OVERSAMPLE - 1);
+    localparam [TW-1:0] STOP15     = TW'(OVERSAMPLE + OVERSAMPLE/2 - 1);
+    localparam [TW-1:0] STOP2      = TW'(2*OVERSAMPLE - 1);
 
-    // ------------------------------------------------------------------------
-    // Bit-period generator: one tick per transmitted bit. bit_period clocks =
-    // OVERSAMPLE * cfg_divisor. Counts down from bit_period-1 to 0; bit_tick at 0.
-    // ------------------------------------------------------------------------
-    wire [BPW-1:0] bit_period = cfg_divisor * OVERSAMPLE;
-    reg  [BPW-1:0] btime;
-    // bit_tick depends on `running` (state), so it is declared below, after them
-    // -- strict declare-before-use (never rely on Verilog implicit-net creation).
-
-    // ------------------------------------------------------------------------
-    // State / datapath
-    // ------------------------------------------------------------------------
     typedef enum logic [2:0] {
         IDLE   = 3'd0,
-        START  = 3'd1,
-        DATA   = 3'd2,
-        PARITY = 3'd3,
-        STOP   = 3'd4
+        LOAD   = 3'd1,      // accepted; the start bit begins at the next tick
+        START  = 3'd2,
+        DATA   = 3'd3,
+        PARITY = 3'd4,
+        STOP   = 3'd5
     } state_e;
 
-    state_e                state;
-    reg [MAX_DATA_BITS-1:0] shift;       // latched character (LSB-first source)
-    reg [3:0]              bit_idx;      // index of the data bit on the line
-    reg [1:0]              stop_idx;     // stop bits emitted so far
-    reg                    txd_r;        // registered serial output (idle = mark)
-    reg                    parity_bit;   // precomputed parity for the latched char
+    req_s                   req_u;
+    state_e                 state;
+    reg [MAX_DATA_BITS-1:0] shift;       // data bits still to send, LSB next
+    reg [3:0]               bits_left;   // data bits after the one on the line
+    reg [TW-1:0]            tcnt;
+    reg                     txd_r;
+    reg                     parity_bit;
+    reg                     parity_en_q;
+    reg [TW-1:0]            stop_len_q;  // stop length in ticks, minus 1
 
-    assign txd       = txd_r;
-    assign req_ready = (state == IDLE);
-    wire   running   = (state != IDLE);
-    wire   bit_tick  = running && (btime == {BPW{1'b0}});  // one tick per transmitted bit
+    always_comb req_u = req_s'(req_dat);
 
-    wire   req_fire  = req_valid && req_ready;
+    assign txd       = txd_r && !brk;
+    assign busy      = (state != IDLE);
+    wire bit_end  = tick && (tcnt == '0);
 
-    // Number of stop bits to emit: 0 => 1 stop; otherwise 2 (1.5, which the spec
-    // allows only for 5-bit chars, is emitted as 2 -- the receiver checks only the
-    // first stop bit, so this is interoperable; see docs O-6).
-    wire [1:0] n_stop = (cfg_stop_bits == 2'd0) ? 2'd1 : 2'd2;
+    // A character is accepted when idle, or on the tick that ends the stop
+    // bit, so back-to-back frames have no gap. In IDLE, tcnt is the mark
+    // still owed after a break.
+    assign req_ready = !brk && (((state == IDLE) && (tcnt == '0)) ||
+                                ((state == STOP) && bit_end));
 
-    // Parity over the significant data bits (combinational, on the incoming char).
-    // odd  (parity_even=0): make total #1s odd  -> ~^data
-    // even (parity_even=1): make total #1s even ->  ^data
-    // stick(parity_stick=1): forced -> ~parity_even (0 if even-select, 1 if odd).
+    wire req_fire = req_valid && req_ready;
+
+    // odd (parity_even=0): an odd number of 1s in data+parity; even: even;
+    // stick: the parity bit is fixed at !parity_even.
     function automatic logic calc_parity(input logic [MAX_DATA_BITS-1:0] d,
                                          input logic [3:0] wbits,
                                          input logic even, input logic stick);
         logic [MAX_DATA_BITS-1:0] mask;
         logic                     p;
-        mask = (wbits >= MAX_DATA_BITS) ? {MAX_DATA_BITS{1'b1}}
-                                    : ((1 << wbits) - 1);
-        p = ^(d & mask);                 // even parity of significant bits
-        if (!even) p = ~p;               // odd parity
-        if (stick) p = ~even;            // stick overrides
+        mask = (wbits >= 4'(MAX_DATA_BITS)) ? {MAX_DATA_BITS{1'b1}}
+                                            : MAX_DATA_BITS'((1 << wbits) - 1);
+        p = ^(d & mask);
+        if (!even) p = ~p;
+        if (stick) p = ~even;
         return p;
     endfunction
 
     always @(posedge clock or posedge reset) begin
         if (reset) begin
-            state      <= IDLE;
-            shift      <= '0;
-            bit_idx    <= '0;
-            stop_idx   <= '0;
-            txd_r      <= 1'b1;          // idle = mark
-            parity_bit <= 1'b0;
-            btime      <= '0;
+            state       <= IDLE;
+            shift       <= '0;
+            bits_left   <= '0;
+            tcnt        <= '0;
+            txd_r       <= 1'b1;
+            parity_bit  <= 1'b0;
+            parity_en_q <= 1'b0;
+            stop_len_q  <= STOP1;
         end else begin
-            // bit-period countdown (only while transmitting)
-            if (state == IDLE) begin
-                btime <= (bit_period == 0) ? '0 : (bit_period - 1'b1);
-            end else if (btime == 0) begin
-                btime <= (bit_period == 0) ? '0 : (bit_period - 1'b1);
-            end else begin
-                btime <= btime - 1'b1;
-            end
+            if (tick && tcnt != '0)
+                tcnt <= tcnt - 1'b1;
 
             case (state)
                 IDLE: begin
-                    txd_r <= 1'b1;       // hold mark
-                    if (req_fire && (cfg_divisor != 0)) begin
-                        shift      <= req_u.data;
-                        parity_bit <= calc_parity(req_u.data, cfg_word_bits,
-                                                  cfg_parity_even, cfg_parity_stick);
-                        bit_idx    <= '0;
-                        stop_idx   <= '0;
-                        txd_r      <= 1'b0;   // drive the start bit (space)
-                        state      <= START;
-                        btime      <= (bit_period == 0) ? '0 : (bit_period - 1'b1);
+                    // Mark from brk falling to the next start bit: the
+                    // start goes out on the tick after tcnt reaches 0,
+                    // BRK_MARK ticks on, which is at least a bit.
+                    if (brk)
+                        tcnt <= BRK_MARK;
+                end
+                LOAD: begin
+                    if (tick) begin
+                        txd_r <= 1'b0;
+                        tcnt  <= BIT_TICKS;
+                        state <= START;
                     end
                 end
                 START: begin
-                    if (bit_tick) begin
-                        // start bit done -> first data bit (LSB)
-                        txd_r   <= shift[0];
-                        bit_idx <= 4'd0;
-                        state   <= DATA;
+                    if (bit_end) begin
+                        txd_r <= shift[0];
+                        shift <= shift >> 1;
+                        tcnt  <= BIT_TICKS;
+                        state <= DATA;
                     end
                 end
                 DATA: begin
-                    if (bit_tick) begin
-                        if ((bit_idx + 1) < cfg_word_bits) begin
-                            bit_idx <= bit_idx + 1'b1;
-                            txd_r   <= shift[bit_idx + 1];
-                        end else if (cfg_parity_en) begin
+                    if (bit_end) begin
+                        if (bits_left != 4'd0) begin
+                            bits_left <= bits_left - 4'd1;
+                            txd_r     <= shift[0];
+                            shift     <= shift >> 1;
+                            tcnt      <= BIT_TICKS;
+                        end else if (parity_en_q) begin
                             txd_r <= parity_bit;
+                            tcnt  <= BIT_TICKS;
                             state <= PARITY;
                         end else begin
-                            txd_r    <= 1'b1;   // stop = mark
-                            stop_idx <= 2'd0;
-                            state    <= STOP;
+                            txd_r <= 1'b1;
+                            tcnt  <= stop_len_q;
+                            state <= STOP;
                         end
                     end
                 end
                 PARITY: begin
-                    if (bit_tick) begin
-                        txd_r    <= 1'b1;       // stop = mark
-                        stop_idx <= 2'd0;
-                        state    <= STOP;
+                    if (bit_end) begin
+                        txd_r <= 1'b1;
+                        tcnt  <= stop_len_q;
+                        state <= STOP;
                     end
                 end
                 STOP: begin
-                    if (bit_tick) begin
-                        if ((stop_idx + 1) < n_stop) begin
-                            stop_idx <= stop_idx + 1'b1;
-                            txd_r    <= 1'b1;   // additional stop bit
-                        end else begin
-                            txd_r <= 1'b1;      // back to idle (mark)
-                            state <= IDLE;
-                        end
-                    end
+                    if (bit_end)
+                        state <= IDLE;
                 end
                 default: state <= IDLE;
             endcase
+
+            // Accept: the start bit begins on this tick, or the next one.
+            if (req_fire) begin
+                shift       <= req_u.data;
+                bits_left   <= cfg_word_bits - 4'd1;
+                parity_bit  <= calc_parity(req_u.data, cfg_word_bits,
+                                           cfg_parity_even, cfg_parity_stick);
+                parity_en_q <= cfg_parity_en;
+                stop_len_q  <= (cfg_stop_bits == 2'd0) ? STOP1 :
+                               (cfg_word_bits == 4'd5) ? STOP15 : STOP2;
+                if (tick) begin
+                    txd_r <= 1'b0;
+                    tcnt  <= BIT_TICKS;
+                    state <= START;
+                end else begin
+                    state <= LOAD;
+                end
+            end
         end
     end
 

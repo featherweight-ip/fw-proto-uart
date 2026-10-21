@@ -1,7 +1,7 @@
 # Protocol property checking
 
 `uart_proto_checker.sv` is the kit's passive, reusable protocol-invariant checker. It
-takes only inputs — the serial `line` and the active framing `cfg_*` — so it can be
+takes only inputs — the serial `line` and the active `cfg_divisor` — so it can be
 instantiated or bound on any UART line tap: in the formal harness, the simulation
 testbench, or alongside real RTL.
 
@@ -12,12 +12,16 @@ wire**: the *receiver* detects it and reports status. It is not a transmitter vi
 so the checker does **not** assert framing correctness. The true transmitter-side line
 invariants are:
 
-1. **Reset / idle (§5.1).** While in reset the line is held at **mark** (the idle level).
-2. **Bit-period stability (§5.1).** The line is driven **stable for a whole bit period** —
+1. **Reset / idle.** While in reset the line is held at **mark** (the idle level).
+2. **Bit-period stability.** The line is driven **stable for a whole bit period** —
    equivalently, two line transitions are never closer than one bit period
    (`OVERSAMPLE × cfg_divisor` cycles). This is the UART analog of a handshake
    "hold-until-accepted" rule and the single most valuable always-on line check. The
-   first transition out of post-reset idle is exempt (idle has no minimum duration).
+   first transition out of post-reset idle is exempt (idle has no minimum duration),
+   and so is the first after a divisor change (the run in progress was timed at the
+   old rate). A break raised in the middle of a character, and the frames that
+   `send_err()`/`glitch()` inject, break this rule on purpose; the sim bench watches
+   the tx core's output for that reason.
 
 There is no response/qualifier *dependency* rule (UART has no wire handshake) and no
 ordering/ID rule (one self-framed character per direction), so those checks — central to
@@ -43,9 +47,9 @@ Each rule is emitted twice, with one source of truth per layer:
 
 The checker ships `cover`s for a start edge (idle→space), a return to mark, and a
 full-bit-period transition, so a green proof or sim run is demonstrably not vacuous.
-`CHECK_STABILITY` (default on) lets a consumer disable the dwell check — the formal
-harness disables it because at the shrunk bit period (2 cycles) it is near-vacuous, and
-it is meaningfully exercised in the sim testbench at the real oversampled rate.
+`CHECK_STABILITY` (default on) lets a consumer disable the dwell check. The round-trip
+formal harness keeps it on: every tx bit edge is on a tick, so at `OVERSAMPLE = 2` and
+divisor 1 or 2 each bit is exactly 2 or 4 clocks, and the check is exact there too.
 
 ## Receiver-detected errors
 
