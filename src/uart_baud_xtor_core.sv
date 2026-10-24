@@ -14,7 +14,10 @@
 // from it then); the 16550's own reload behaviour (U24) is the model's.
 //
 // The counter runs from cfg_divisor down to 1 and the tick is at 1 (or 0,
-// after reset or while stopped), so a reload needs no subtractor.
+// after reset or while stopped), so a reload needs no subtractor. `tick` is
+// registered, a clock behind the counter: its consumers (each core's bit
+// timing, a 16550's character timeout) then start from a flop rather than
+// from the counter's and the divisor's zero tests.
 // ----------------------------------------------------------------------------
 module uart_baud_xtor_core #(
         parameter int DIV_WIDTH = 16
@@ -28,15 +31,20 @@ module uart_baud_xtor_core #(
     reg [DIV_WIDTH-1:0] cnt;    // clocks to the next tick, plus 1 (0 at reset)
     wire                due = (cnt[DIV_WIDTH-1:1] == '0);   // cnt is 0 or 1
 
-    assign tick = (cfg_divisor != '0) && due;
+    reg                 tick_r;
+
+    assign tick = tick_r;
 
     always @(posedge clock or posedge reset) begin
         if (reset) begin
-            cnt <= '0;
-        end else if (!due) begin
-            cnt <= cnt - 1'b1;
-        end else if (cfg_divisor != '0) begin
-            cnt <= cfg_divisor;
+            cnt    <= '0;
+            tick_r <= 1'b0;
+        end else begin
+            tick_r <= (cfg_divisor != '0) && due;
+            if (!due)
+                cnt <= cnt - 1'b1;
+            else if (cfg_divisor != '0)
+                cnt <= cfg_divisor;
         end
     end
 
